@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environment
+venv/
+.venv/
+
+# Secrets (none needed today, this API is keyless, but keep the habit)
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# NOTE: data/ is intentionally NOT ignored. The whole point of this repo
+# is the archived trades and metadata under data/, so it is tracked and
+# committed by the daily workflow.
