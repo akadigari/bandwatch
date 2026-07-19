@@ -8,22 +8,39 @@ exists.
 
 What it does, every time you run it:
 
-1. Pull new trades from GET /markets/trades (paged, newest first) and add
-   any we do not already have to a monthly parquet file under
-   data/trades/YYYY-MM.parquet. Every trade has a trade_id, so we can
-   always tell a trade we already saved from a new one.
-2. Keep chipping away at older history in the background (a separate
+1. Pull new trades from GET /markets/trades (paged, newest first). Every
+   trade has a trade_id, so we can always tell a trade we already saved
+   from a new one.
+2. Group those trades into daily per-band aggregates: for every (UTC
+   date, market ticker, price band in cents 1-99, taker side), add up
+   how many trades happened, how many contracts, and how many dollars.
+   That goes to data/agg/YYYY-MM.parquet. This is the default and the
+   only thing the daily cron job writes: see "Why aggregates, not raw
+   ticks" in README for the full reasoning, but the short version is a
+   live measurement showed Kalshi's public trade firehose runs about 8
+   to 9 million trades a day, which turns into roughly 470-500 MB/day of
+   raw parquet: past GitHub's 100 MB file limit within a day or two of
+   running. Daily band aggregates are tiny by comparison and are all the
+   price-band curve analysis in GATES.md actually needs.
+3. Optionally, if run with --raw, also write every individual trade to a
+   monthly parquet file under data/raw/YYYY-MM.parquet. This is local
+   only: data/raw/ is gitignored, so nothing there ever gets committed.
+   It exists for anyone who wants full tick-level detail on their own
+   machine, not for the repo.
+4. Keep chipping away at older history in the background (a separate
    "backfill" pointer that works backward in time, a bit further each
    day) so we grab as much of the pre-existing window as we can before it
    rolls off.
-3. Take a daily snapshot of market metadata (status, result, close_time,
+5. Take a daily snapshot of market metadata (status, result, close_time,
    volume_fp) and series metadata (fee_type, fee_multiplier, category) for
    every ticker that traded that day, so a later analysis can check our
    trade counts against Kalshi's own volume numbers.
 
 Run it once a day. It is safe to run it twice in the same day too: nothing
-gets double counted, because everything is deduped by trade_id (trades) or
-by (snapshot_date, ticker) (metadata).
+gets double counted. Aggregation only ever folds in trades that have never
+been aggregated before (see dedupe_for_aggregation), raw trades (--raw) are
+deduped by trade_id same as always, and metadata is deduped by
+(snapshot_date, ticker).
 
 See GATES.md for the rules this project has to pass before anyone trusts a
 number that comes out of the data this script collects.
@@ -54,11 +71,18 @@ KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-TRADES_DIR = DATA_DIR / "trades"
+RAW_DIR = DATA_DIR / "raw"     # --raw only; gitignored, local machine only
+AGG_DIR = DATA_DIR / "agg"     # the default: daily per-band aggregates, tracked in git
 META_DIR = DATA_DIR / "meta"
 STATE_FILE = META_DIR / "state.json"
 MARKETS_META_FILE = META_DIR / "markets.parquet"
 SERIES_META_FILE = META_DIR / "series.parquet"
+HOT_TRADES_FILE = META_DIR / "hot_trades.parquet"
+
+# How many rows the hot-trades dedupe buffer keeps at each edge (the
+# newest trades and the oldest/frontier trades). See dedupe_for_aggregation
+# for why this can stay small no matter how many trades a run pulls.
+HOT_BUFFER_KEEP = 3000
 
 PAGE_LIMIT = 1000  # Kalshi's own max page size for /markets/trades
 
@@ -215,6 +239,41 @@ def resolve_series_tickers(market_tickers: list[str], getter=http_get_json,
     return resolved
 
 
+def trade_date(created_time: str) -> str | None:
+    """'2026-07-19T03:52:14.21Z' -> '2026-07-19', the UTC calendar date
+    used to group daily aggregates. Returns None for empty input."""
+    if not created_time:
+        return None
+    return created_time[:10]
+
+
+def taker_price(trade: dict) -> float | None:
+    """The price the taker actually paid: yes_price if they took the yes
+    side, no_price if they took the no side. Returns None if taker_side
+    isn't one of the two known values, so a bad/missing side gets left
+    out of the aggregate instead of silently banded under the wrong
+    price."""
+    side = trade.get("taker_side")
+    if side == "yes":
+        return trade.get("yes_price")
+    if side == "no":
+        return trade.get("no_price")
+    return None
+
+
+def band_from_price(price_dollars: float | None) -> int | None:
+    """Turn a dollar price like 0.12 into a 1-99 cent price band. Returns
+    None if the price is missing or outside the valid 1-99 range (a price
+    of exactly $0 or $1 means one side of the contract was free, which can
+    happen right around settlement and isn't a normal trading band)."""
+    if price_dollars is None:
+        return None
+    cents = round(price_dollars * 100)
+    if cents < 1 or cents > 99:
+        return None
+    return int(cents)
+
+
 def normalize_trade(raw: dict) -> dict:
     """Turn one raw trade from GET /markets/trades into the row shape we
     store on disk."""
@@ -327,8 +386,15 @@ def page_trades(max_ts: float | None = None, stop_at_ts: float | None = None,
 
 
 # ---------------------------------------------------------------------------
-# Parquet storage: trades
+# Parquet storage: raw trades (optional, --raw only, local machine only)
 # ---------------------------------------------------------------------------
+#
+# Everything in this section is unchanged from the original archiver except
+# that it now writes under data/raw/ instead of data/trades/, and it only
+# runs when --raw is passed. data/raw/ is gitignored: nothing here is ever
+# committed. It's here for anyone who wants full tick-level detail on their
+# own disk. The default path the daily cron job actually uses is the
+# aggregate section further down.
 
 TRADE_COLUMNS = [
     "trade_id", "ticker", "created_time", "created_ts", "count",
@@ -341,17 +407,17 @@ def _empty_trades_df() -> pd.DataFrame:
 
 
 def load_month_parquet(month: str) -> pd.DataFrame:
-    """Load an existing monthly trade file, or an empty frame with the
+    """Load an existing monthly raw-trade file, or an empty frame with the
     right columns if it does not exist yet."""
-    path = TRADES_DIR / f"{month}.parquet"
+    path = RAW_DIR / f"{month}.parquet"
     if path.exists():
         return pd.read_parquet(path)
     return _empty_trades_df()
 
 
 def save_month_parquet(month: str, df: pd.DataFrame) -> None:
-    TRADES_DIR.mkdir(parents=True, exist_ok=True)
-    path = TRADES_DIR / f"{month}.parquet"
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    path = RAW_DIR / f"{month}.parquet"
     df = df.sort_values("created_ts", kind="stable").reset_index(drop=True)
     df.to_parquet(path, index=False)
 
@@ -368,8 +434,9 @@ def dedupe_trades(existing: pd.DataFrame, new_rows: list[dict]) -> pd.DataFrame:
 
 
 def append_trades(trades: list[dict]) -> dict[str, int]:
-    """Group trades by month and append them to the right monthly parquet
-    file, deduped by trade_id. Returns {month: new_row_count_added}."""
+    """Group trades by month and append them to the right monthly raw
+    parquet file under data/raw/, deduped by trade_id. Returns {month:
+    new_row_count_added}. Only called when --raw is passed."""
     by_month: dict[str, list[dict]] = {}
     for t in trades:
         if not t.get("trade_id") or not t.get("created_time"):
@@ -382,6 +449,159 @@ def append_trades(trades: list[dict]) -> dict[str, int]:
         before = len(existing)
         merged = dedupe_trades(existing, rows)
         save_month_parquet(month, merged)
+        added[month] = len(merged) - before
+    return added
+
+
+# ---------------------------------------------------------------------------
+# Bounded trade-id watermark for aggregation idempotency
+# ---------------------------------------------------------------------------
+#
+# Aggregation needs the same guarantee raw storage always had: run the
+# archiver twice on the same trades and nothing gets double counted. The
+# old way to know "have I already saved this trade_id" was to check the
+# full trade history on disk. That still works when --raw is on, but it is
+# not available by default any more, since the whole point of aggregating
+# is to stop keeping that full history in git.
+#
+# The fix leans on how page_trades actually overlaps between runs (see its
+# docstring): a run can only ever re-fetch trades right at its own current
+# watermark (newest_ts) or its own current backfill frontier (frontier_ts),
+# bounded to roughly one page's worth (PAGE_LIMIT) on each side. It can
+# never re-fetch trades from the middle of a previous run's haul. So this
+# only needs to remember trade_ids near those two edges, not every trade
+# ever aggregated. That is what keeps this buffer small (HOT_BUFFER_KEEP
+# rows per edge) even though a single run can pull millions of trades.
+
+def load_hot_trades() -> pd.DataFrame:
+    if HOT_TRADES_FILE.exists():
+        return pd.read_parquet(HOT_TRADES_FILE)
+    return _empty_trades_df()
+
+
+def save_hot_trades(df: pd.DataFrame) -> None:
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    if df.empty:
+        df = _empty_trades_df()
+    df.to_parquet(HOT_TRADES_FILE, index=False)
+
+
+def trim_hot_trades(df: pd.DataFrame, keep: int = HOT_BUFFER_KEEP) -> pd.DataFrame:
+    """Keep only the newest `keep` rows and the oldest `keep` rows by
+    created_ts (plus any rows with no timestamp, which get kept as-is
+    since they cannot be dropped safely). That covers both edges a future
+    run's boundary page could touch (see module note above) without
+    keeping anywhere near a full day of trades around."""
+    if len(df) <= keep * 2:
+        return df.drop_duplicates(subset="trade_id", keep="last")
+    with_ts = df.dropna(subset=["created_ts"]).sort_values("created_ts")
+    without_ts = df[df["created_ts"].isna()]
+    trimmed = pd.concat([with_ts.head(keep), with_ts.tail(keep), without_ts])
+    return trimmed.drop_duplicates(subset="trade_id", keep="last")
+
+
+def dedupe_for_aggregation(fetched_trades: list[dict]) -> list[dict]:
+    """Filter `fetched_trades` down to the ones never folded into an
+    aggregate before, using the hot-trades buffer as a bounded stand-in
+    for "the full trade history," then refresh that buffer.
+
+    Feeding the exact same trades in twice in a row (a same-day re-run)
+    returns an empty list the second time, since every trade_id will
+    already be in the buffer from the first call.
+    """
+    if not fetched_trades:
+        return []
+    existing = load_hot_trades()
+    already_seen = set(existing["trade_id"]) if not existing.empty else set()
+    merged = dedupe_trades(existing, fetched_trades)
+    new_rows = merged[~merged["trade_id"].isin(already_seen)]
+    save_hot_trades(trim_hot_trades(merged))
+    return new_rows.to_dict("records")
+
+
+# ---------------------------------------------------------------------------
+# Parquet storage: daily per-band aggregates (the default)
+# ---------------------------------------------------------------------------
+
+AGG_COLUMNS = ["date", "ticker", "band_cents", "taker_side", "trade_count", "contracts", "dollars"]
+AGG_GROUP_KEY = ["date", "ticker", "band_cents", "taker_side"]
+
+
+def aggregate_trades(trades: list[dict]) -> pd.DataFrame:
+    """Group trades into (UTC date, ticker, price band in cents, taker
+    side) buckets and sum trade_count / contracts / dollars for each
+    bucket. Trades missing a ticker, a usable taker side/price, or a band
+    in the valid 1-99 cent range are left out rather than guessed at."""
+    buckets: dict[tuple, dict] = {}
+    for t in trades:
+        date = trade_date(t.get("created_time"))
+        ticker = t.get("ticker")
+        side = t.get("taker_side")
+        price = taker_price(t)
+        band = band_from_price(price)
+        count = t.get("count")
+        if not date or not ticker or side not in ("yes", "no") or band is None or count is None:
+            continue
+        key = (date, ticker, band, side)
+        bucket = buckets.setdefault(key, {"trade_count": 0, "contracts": 0.0, "dollars": 0.0})
+        bucket["trade_count"] += 1
+        bucket["contracts"] += count
+        bucket["dollars"] += count * price
+
+    rows = [
+        {"date": date, "ticker": ticker, "band_cents": band, "taker_side": side, **vals}
+        for (date, ticker, band, side), vals in buckets.items()
+    ]
+    return pd.DataFrame(rows, columns=AGG_COLUMNS)
+
+
+def load_month_agg(month: str) -> pd.DataFrame:
+    """Load an existing monthly aggregate file, or an empty frame with the
+    right columns if it does not exist yet."""
+    path = AGG_DIR / f"{month}.parquet"
+    if path.exists():
+        return pd.read_parquet(path)
+    return pd.DataFrame(columns=AGG_COLUMNS)
+
+
+def save_month_agg(month: str, df: pd.DataFrame) -> None:
+    AGG_DIR.mkdir(parents=True, exist_ok=True)
+    path = AGG_DIR / f"{month}.parquet"
+    df = df.sort_values(AGG_GROUP_KEY, kind="stable").reset_index(drop=True)
+    df.to_parquet(path, index=False)
+
+
+def merge_aggregates(existing: pd.DataFrame, new_agg: pd.DataFrame) -> pd.DataFrame:
+    """Merge new aggregate rows into an existing monthly frame by ADDING
+    onto any bucket that already exists for the same group key, not
+    overwriting it. This is safe because the caller only ever passes in
+    aggregates built from trades dedupe_for_aggregation confirmed were
+    never aggregated before, so every row here is a genuinely new
+    contribution to its bucket."""
+    if new_agg.empty:
+        return existing
+    combined = new_agg if existing.empty else pd.concat([existing, new_agg], ignore_index=True)
+    grouped = combined.groupby(AGG_GROUP_KEY, as_index=False)[["trade_count", "contracts", "dollars"]].sum()
+    return grouped[AGG_COLUMNS]
+
+
+def append_aggregates(trades: list[dict]) -> dict[str, int]:
+    """Aggregate `trades` and merge the result into the right monthly
+    data/agg/YYYY-MM.parquet file(s), summing onto existing buckets.
+    Returns {month: new_bucket_row_count_added} (not trade counts: a
+    "row" here is a (date, ticker, band, side) bucket)."""
+    new_agg = aggregate_trades(trades)
+    if new_agg.empty:
+        return {}
+    new_agg = new_agg.assign(month=new_agg["date"].str[:7])
+
+    added: dict[str, int] = {}
+    for month, group in new_agg.groupby("month"):
+        group = group.drop(columns="month")
+        existing = load_month_agg(month)
+        before = len(existing)
+        merged = merge_aggregates(existing, group)
+        save_month_agg(month, merged)
         added[month] = len(merged) - before
     return added
 
@@ -499,6 +719,25 @@ def sum_counts_by_ticker(trades: list[dict]) -> dict[str, float]:
     return totals
 
 
+def sum_contracts_by_ticker_from_aggregates(agg_rows: list[dict]) -> dict[str, float]:
+    """Sum the 'contracts' field of aggregate rows, grouped by ticker. This
+    is what feeds GATES.md gate 1 now that the archive stores daily
+    per-band aggregates instead of one row per trade: same reconciliation
+    math as sum_counts_by_ticker, just summing 'contracts' across every
+    band and taker side for a ticker instead of summing 'count' across
+    every raw trade for a ticker. `agg_rows` can be any iterable of dicts
+    with 'ticker' and 'contracts' keys, e.g. a data/agg parquet file's
+    df.to_dict('records')."""
+    totals: dict[str, float] = {}
+    for row in agg_rows:
+        ticker = row.get("ticker")
+        contracts = row.get("contracts")
+        if not ticker or contracts is None:
+            continue
+        totals[ticker] = totals.get(ticker, 0.0) + contracts
+    return totals
+
+
 def reconciliation_report(archived_counts: dict[str, float],
                            api_volumes: dict[str, float],
                            tolerance: float = 0.02) -> dict:
@@ -556,6 +795,7 @@ def save_state(state: dict) -> None:
 
 def run(catchup_max_pages: int = CATCHUP_MAX_PAGES,
         backfill_max_pages: int = BACKFILL_MAX_PAGES,
+        write_raw: bool = False,
         getter=http_get_json) -> dict:
     """Run one full archive cycle. Returns a summary dict (also used by the
     live verification run and printed by __main__)."""
@@ -606,7 +846,12 @@ def run(catchup_max_pages: int = CATCHUP_MAX_PAGES,
             backfill_complete = reached_end
             reached_absolute_end = reached_end
 
-    added_by_month = append_trades(all_trades)
+    new_for_aggregation = dedupe_for_aggregation(all_trades)
+    agg_added_by_month = append_aggregates(new_for_aggregation)
+
+    raw_added_by_month: dict[str, int] = {}
+    if write_raw:
+        raw_added_by_month = append_trades(all_trades)
 
     tickers_seen = sorted(set(t["ticker"] for t in all_trades if t.get("ticker")))
     snapshot_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -622,7 +867,10 @@ def run(catchup_max_pages: int = CATCHUP_MAX_PAGES,
 
     return {
         "trades_pulled": len(all_trades),
-        "trades_new_by_month": added_by_month,
+        "trades_new_for_aggregation": len(new_for_aggregation),
+        "agg_buckets_new_by_month": agg_added_by_month,
+        "raw_enabled": write_raw,
+        "trades_new_by_month": raw_added_by_month,
         "tickers_seen": len(tickers_seen),
         "newest_ts": newest_ts,
         "frontier_ts": frontier_ts,
@@ -644,14 +892,24 @@ def main(argv: list[str] | None = None) -> int:
                          help="page budget for catching up to new trades this run")
     parser.add_argument("--backfill-max-pages", type=int, default=BACKFILL_MAX_PAGES,
                          help="page budget for walking further back into history this run")
+    parser.add_argument("--raw", action="store_true",
+                         help="also write every individual trade to data/raw/YYYY-MM.parquet "
+                              "(local only: data/raw/ is gitignored, never committed)")
     args = parser.parse_args(argv)
 
     summary = run(catchup_max_pages=args.catchup_max_pages,
-                  backfill_max_pages=args.backfill_max_pages)
+                  backfill_max_pages=args.backfill_max_pages,
+                  write_raw=args.raw)
 
     print(f"trades pulled this run: {summary['trades_pulled']}")
-    for month, n in sorted(summary["trades_new_by_month"].items()):
-        print(f"  {month}.parquet: +{n} new rows")
+    print(f"trades new to aggregation (never seen before): {summary['trades_new_for_aggregation']}")
+    for month, n in sorted(summary["agg_buckets_new_by_month"].items()):
+        print(f"  data/agg/{month}.parquet: +{n} new (date, ticker, band, side) buckets")
+    if summary["raw_enabled"]:
+        for month, n in sorted(summary["trades_new_by_month"].items()):
+            print(f"  data/raw/{month}.parquet: +{n} new rows")
+    else:
+        print("raw per-trade storage: off (pass --raw to also write data/raw/, local only)")
     print(f"distinct tickers seen: {summary['tickers_seen']}")
     print(f"newest trade archived: {_fmt_ts(summary['newest_ts'])}")
     print(f"oldest trade archived (backfill frontier): {_fmt_ts(summary['frontier_ts'])}")

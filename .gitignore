@@ -17,6 +17,14 @@ venv/
 .idea/
 .vscode/
 
-# NOTE: data/ is intentionally NOT ignored. The whole point of this repo
-# is the archived trades and metadata under data/, so it is tracked and
-# committed by the daily workflow.
+# NOTE: data/ is intentionally NOT ignored overall. data/agg/ (daily
+# per-band aggregates) and data/meta/ (state + metadata snapshots) are the
+# whole point of this repo, so they are tracked and committed by the daily
+# workflow.
+#
+# data/raw/ is the one exception. That's the optional --raw output: every
+# individual trade, one parquet file per month. A live measurement showed
+# Kalshi's public trade firehose runs 8-9 million trades a day, which is
+# roughly 470-500 MB/day of raw parquet: past GitHub's 100 MB file limit
+# within a day or two. So raw ticks are local-only, never committed.
+data/raw/
