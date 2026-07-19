@@ -1,0 +1,54 @@
+name: Bandwatch archiver
+
+# Once a day, off the top of the hour (GitHub delays top-of-hour crons
+# heavily, same reasoning as the owner's tipoff scanner) and at a quiet
+# minute that does not collide with tipoff's own hourly runs. 09:23 UTC is
+# about 5:23am US Eastern: a low-traffic hour for both GitHub Actions
+# runners and for us checking in on it.
+on:
+  schedule:
+    - cron: "23 9 * * *"
+  workflow_dispatch: {}   # manual "Run workflow" button for testing
+
+permissions:
+  contents: write   # the run commits new parquet/meta files back
+
+concurrency:
+  group: bandwatch-archive   # never let two archive runs race on the same files
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    # Kalshi's public trade firehose runs at several million trades a day
+    # platform-wide (see archiver.py's page-budget comments), so a run can
+    # take a while, especially while the backfill pointer is still working
+    # through older history. This is generous on purpose.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run archiver
+        run: python archiver.py
+
+      - name: Commit archived trades and metadata back to the repo
+        run: |
+          git config user.name "bandwatch-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "nothing new this run"
+            exit 0
+          fi
+          git commit -m "bandwatch: archive $(date -u +'%Y-%m-%d %H:%M UTC')"
+          # another run may have pushed while this one archived; rebase then push
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          git push
