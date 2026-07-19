@@ -79,3 +79,19 @@ holds until something else earns its own gates doc.
   single full backfill and before any analysis code exists. Any later
   edit must be logged here with its reason, and may only ADD a gate or
   TIGHTEN an existing one.
+
+## Clarification notes (not rule changes)
+
+- 2026-07-19: the archiver now stores daily per-band aggregates
+  (data/agg/YYYY-MM.parquet) instead of one row per trade, because
+  Kalshi's real trade volume (8-9 million trades/day, confirmed live)
+  would blow past GitHub's 100 MB file limit almost immediately if every
+  trade were kept in git. Gate 1's "archived trade count" now means: sum
+  the `contracts` field of every aggregate bucket for a ticker (across
+  all bands and both taker sides), and compare that sum to the market's
+  `volume_fp`, exactly the same 95%-of-markets-within-2% check as before.
+  Gates 2 and 3 already operate at the band level, which is exactly what
+  the aggregate rows hold (trade_count, contracts, dollars per band per
+  day). No gate's number or pass bar changed; only where the number comes
+  from changed. See README's storage design section for the full
+  reasoning and the honest tradeoff that comes with it.
