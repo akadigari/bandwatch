@@ -1,0 +1,9 @@
+{
+  "series": {
+    "ticker": "KXHIGHLAX",
+    "title": "Highest temperature in Los Angeles",
+    "category": "Climate and Weather",
+    "fee_type": "quadratic",
+    "fee_multiplier": 1
+  }
+}

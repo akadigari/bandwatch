@@ -1,0 +1,21 @@
+{
+  "cursor": "",
+  "markets": [
+    {
+      "ticker": "KXHIGHLAX-26JUL19-T80",
+      "event_ticker": "KXHIGHLAX-26JUL19",
+      "status": "active",
+      "result": "",
+      "close_time": "2026-07-20T07:59:00Z",
+      "volume_fp": "40402.48"
+    },
+    {
+      "ticker": "KXBTC15M-26JUL190000-00",
+      "event_ticker": "KXBTC15M-26JUL190000",
+      "status": "finalized",
+      "result": "yes",
+      "close_time": "2026-07-19T00:15:00Z",
+      "volume_fp": "20.50"
+    }
+  ]
+}
