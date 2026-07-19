@@ -18,6 +18,22 @@ def test_sum_counts_by_ticker():
     assert totals == {"A": 8.0, "B": 10.0}
 
 
+def test_sum_contracts_by_ticker_from_aggregates():
+    # Same shape as sum_counts_by_ticker's test, but summing aggregate
+    # bucket rows (one row per date/ticker/band/side) instead of raw
+    # trade rows: this is the gate 1 input now that the archive stores
+    # daily per-band aggregates instead of one row per trade.
+    agg_rows = [
+        {"ticker": "A", "band_cents": 12, "taker_side": "yes", "contracts": 5.0},
+        {"ticker": "A", "band_cents": 40, "taker_side": "no", "contracts": 3.0},
+        {"ticker": "B", "band_cents": 12, "taker_side": "yes", "contracts": 10.0},
+        {"ticker": None, "band_cents": 12, "taker_side": "yes", "contracts": 99.0},  # no ticker: ignored
+        {"ticker": "C", "band_cents": 12, "taker_side": "yes", "contracts": None},   # no contracts: ignored
+    ]
+    totals = archiver.sum_contracts_by_ticker_from_aggregates(agg_rows)
+    assert totals == {"A": 8.0, "B": 10.0}
+
+
 def test_reconciliation_report_pct_diff_and_tolerance_flag():
     # Numbers picked so the division comes out exact, so this checks the
     # gate math itself rather than floating-point rounding.

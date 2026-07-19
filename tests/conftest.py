@@ -32,12 +32,15 @@ def redirect_storage(tmp_path, monkeypatch):
     """Point every on-disk path the archiver writes to at a tmp_path
     sandbox, so storage tests never touch the real data/ directory."""
     data_dir = tmp_path / "data"
-    trades_dir = data_dir / "trades"
+    raw_dir = data_dir / "raw"
+    agg_dir = data_dir / "agg"
     meta_dir = data_dir / "meta"
     monkeypatch.setattr(archiver, "DATA_DIR", data_dir)
-    monkeypatch.setattr(archiver, "TRADES_DIR", trades_dir)
+    monkeypatch.setattr(archiver, "RAW_DIR", raw_dir)
+    monkeypatch.setattr(archiver, "AGG_DIR", agg_dir)
     monkeypatch.setattr(archiver, "META_DIR", meta_dir)
     monkeypatch.setattr(archiver, "STATE_FILE", meta_dir / "state.json")
     monkeypatch.setattr(archiver, "MARKETS_META_FILE", meta_dir / "markets.parquet")
     monkeypatch.setattr(archiver, "SERIES_META_FILE", meta_dir / "series.parquet")
+    monkeypatch.setattr(archiver, "HOT_TRADES_FILE", meta_dir / "hot_trades.parquet")
     return data_dir
