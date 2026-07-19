@@ -100,6 +100,13 @@ def http_get_json(url: str, params: dict | None = None, retries: int = HTTP_RETR
     for attempt in range(retries + 1):
         try:
             resp = _session.get(url, params=params, timeout=HTTP_TIMEOUT)
+            if resp.status_code == 404:
+                # A clean "not found," not a glitch. Some callers (see
+                # resolve_series_tickers) deliberately probe a few
+                # candidate URLs and expect some to 404, so this returns
+                # right away instead of burning retries and a warning on
+                # an outcome that is already handled.
+                return None
             if resp.status_code == 429:
                 time.sleep(2.0 * (attempt + 1))
                 continue
@@ -154,13 +161,58 @@ def month_key(created_time: str) -> str:
 
 
 def series_ticker_from_market_ticker(ticker: str) -> str:
-    """A Kalshi market ticker is SERIESTICKER-EVENTDATE-STRIKE (e.g.
-    'KXHIGHLAX-26JUL19-T80' -> 'KXHIGHLAX'). Confirmed live against
-    GET /events/{ticker}, which returns series_ticker directly: the prefix
-    before the first '-' always matches it. Using the prefix means we
-    never have to pay for an extra /events call just to find a market's
-    series."""
+    """The most common shape of a Kalshi market ticker is
+    SERIESTICKER-EVENTDATE-STRIKE (e.g. 'KXHIGHLAX-26JUL19-T80' ->
+    'KXHIGHLAX'), confirmed live against GET /events/{ticker}. This is
+    just the first-guess prefix, not a guarantee: some series tickers
+    have a dash baked into them (see resolve_series_tickers below), so
+    this alone is not enough to find every market's real series."""
     return ticker.split("-", 1)[0]
+
+
+def resolve_series_tickers(market_tickers: list[str], getter=http_get_json,
+                            max_segments: int = 3) -> dict[str, str]:
+    """Map each market ticker to its real series ticker, confirmed live
+    against GET /series/{candidate}.
+
+    Most series tickers are just the market ticker's first dash segment
+    ('KXHIGHLAX-26JUL19-T80' -> 'KXHIGHLAX'). But some sports series carry
+    a dash inside the series ticker itself: 'KXMLBWINS-LAD-26-T95' is
+    really series 'KXMLBWINS-LAD' (one series per team), which 404s on
+    the plain first-segment guess. Confirmed live on 2026-07-19: 2 of 722
+    series lookups in one run 404'd for exactly this reason.
+
+    This tries the 1-segment guess first, and only for tickers where that
+    404s, tries the 2-segment guess, then 3, grouping tickers that share a
+    candidate so each candidate URL is only ever requested once. Tickers
+    that still do not resolve within `max_segments` are left out of the
+    returned dict; callers should treat a missing ticker as "series
+    metadata unavailable," not raise.
+    """
+    remaining = {t: t.split("-") for t in set(market_tickers) if t}
+    resolved: dict[str, str] = {}
+
+    for n in range(1, max_segments + 1):
+        if not remaining:
+            break
+        candidates: dict[str, list[str]] = {}
+        for ticker, segments in remaining.items():
+            if n > len(segments):
+                continue  # this ticker has no more segments left to try
+            candidate = "-".join(segments[:n])
+            candidates.setdefault(candidate, []).append(ticker)
+
+        for candidate, tickers in candidates.items():
+            data = getter(f"{KALSHI_BASE}/series/{candidate}")
+            series = (data or {}).get("series")
+            if not series:
+                continue
+            real_ticker = series.get("ticker", candidate)
+            for t in tickers:
+                resolved[t] = real_ticker
+                remaining.pop(t, None)
+
+    return resolved
 
 
 def normalize_trade(raw: dict) -> dict:
@@ -415,8 +467,8 @@ def snapshot_metadata(tickers: list[str], snapshot_date: str, getter=http_get_js
     for row in market_rows:
         row["snapshot_date"] = snapshot_date
 
-    series_tickers = [series_ticker_from_market_ticker(t) for t in tickers]
-    series_rows = fetch_series_meta(series_tickers, getter=getter)
+    resolved = resolve_series_tickers(tickers, getter=getter)
+    series_rows = fetch_series_meta(sorted(set(resolved.values())), getter=getter)
     for row in series_rows:
         row["snapshot_date"] = snapshot_date
 

@@ -68,6 +68,33 @@ def test_fetch_markets_meta_parses_batch_response(fixture):
     assert by_ticker["KXBTC15M-26JUL190000-00"]["volume_fp"] == 20.50
 
 
+def test_resolve_series_tickers_falls_back_past_a_404():
+    # 'KXHIGHLAX-26JUL19-T80' resolves on the first (1-segment) guess.
+    # 'KXMLBWINS-LAD-26-T95' and 'KXMLBWINS-LAD-26-T115' both 404 on the
+    # 1-segment guess ('KXMLBWINS') and only resolve on the 2-segment one
+    # ('KXMLBWINS-LAD'): this is the real shape found live on 2026-07-19.
+    # Both tickers share that candidate, so it must only be requested once.
+    call_counts: dict[str, int] = {}
+
+    def getter(url, params=None):
+        candidate = url.rsplit("/", 1)[-1]
+        call_counts[candidate] = call_counts.get(candidate, 0) + 1
+        if candidate == "KXHIGHLAX":
+            return {"series": {"ticker": "KXHIGHLAX"}}
+        if candidate == "KXMLBWINS-LAD":
+            return {"series": {"ticker": "KXMLBWINS-LAD"}}
+        return None  # 404: 'KXMLBWINS' alone is not a real series
+
+    resolved = archiver.resolve_series_tickers(
+        ["KXHIGHLAX-26JUL19-T80", "KXMLBWINS-LAD-26-T95", "KXMLBWINS-LAD-26-T115"],
+        getter=getter,
+    )
+    assert resolved["KXHIGHLAX-26JUL19-T80"] == "KXHIGHLAX"
+    assert resolved["KXMLBWINS-LAD-26-T95"] == "KXMLBWINS-LAD"
+    assert resolved["KXMLBWINS-LAD-26-T115"] == "KXMLBWINS-LAD"
+    assert call_counts["KXMLBWINS-LAD"] == 1  # deduped, not once per ticker
+
+
 def test_fetch_series_meta_parses_response(fixture):
     payload = fixture("series_khighlax.json")
 
