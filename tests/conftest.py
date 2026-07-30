@@ -40,7 +40,7 @@ def redirect_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(archiver, "AGG_DIR", agg_dir)
     monkeypatch.setattr(archiver, "META_DIR", meta_dir)
     monkeypatch.setattr(archiver, "STATE_FILE", meta_dir / "state.json")
-    monkeypatch.setattr(archiver, "MARKETS_META_FILE", meta_dir / "markets.parquet")
+    monkeypatch.setattr(archiver, "META_MARKETS_DIR", meta_dir / "markets")
     monkeypatch.setattr(archiver, "SERIES_META_FILE", meta_dir / "series.parquet")
     monkeypatch.setattr(archiver, "HOT_TRADES_FILE", meta_dir / "hot_trades.parquet")
     return data_dir

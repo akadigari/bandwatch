@@ -14,7 +14,8 @@ What it does, every time you run it:
 2. Group those trades into daily per-band aggregates: for every (UTC
    date, market ticker, price band in cents 1-99, taker side), add up
    how many trades happened, how many contracts, and how many dollars.
-   That goes to data/agg/YYYY-MM.parquet. This is the default and the
+   That goes to data/agg/YYYY-MM-DD.parquet, one file per UTC day. This
+   is the default and the
    only thing the daily cron job writes: see "Why aggregates, not raw
    ticks" in README for the full reasoning, but the short version is a
    live measurement showed Kalshi's public trade firehose runs about 8
@@ -75,7 +76,11 @@ RAW_DIR = DATA_DIR / "raw"     # --raw only; gitignored, local machine only
 AGG_DIR = DATA_DIR / "agg"     # the default: daily per-band aggregates, tracked in git
 META_DIR = DATA_DIR / "meta"
 STATE_FILE = META_DIR / "state.json"
-MARKETS_META_FILE = META_DIR / "markets.parquet"
+# Market metadata is one file per snapshot date under data/meta/markets/.
+# It used to be a single markets.parquet, but that file grew about 7 MB a
+# day and was on track to cross GitHub's 100 MB per-file block by
+# mid-August, the same way the monthly aggregate file already did.
+META_MARKETS_DIR = META_DIR / "markets"
 SERIES_META_FILE = META_DIR / "series.parquet"
 HOT_TRADES_FILE = META_DIR / "hot_trades.parquet"
 
@@ -100,8 +105,19 @@ PAGE_LIMIT = 1000  # Kalshi's own max page size for /markets/trades
 #     the way back through the full ~60-65 day window will take many days
 #     of runs and may not finish before the oldest data ages out. That is
 #     an honest limitation, not a bug; see README "What this can't do yet."
-CATCHUP_MAX_PAGES = 6000
+#
+# The catch-up budget is sized so one normal day NEVER hits the cap: a full
+# day is about 9,000 pages, and 15,000 covers a day and a half. Hitting the
+# cap used to silently advance the watermark past trades that were never
+# fetched, which punched permanent holes into Jul 22-25 2026. run() now
+# records any capped catch-up as a hole in state.json so it can be repaired
+# with --repair-date instead of being lost quietly.
+CATCHUP_MAX_PAGES = 15000
 BACKFILL_MAX_PAGES = 2000
+
+# Page budget for --repair-date: one full day re-pulled from scratch is
+# ~9,000 pages, so 20,000 leaves room for a heavy day plus page overlap.
+REPAIR_MAX_PAGES = 20000
 
 MARKETS_PER_META_CALL = 100  # ticker batch size for GET /markets?tickers=
 
@@ -555,24 +571,29 @@ def aggregate_trades(trades: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=AGG_COLUMNS)
 
 
-def load_month_agg(month: str) -> pd.DataFrame:
-    """Load an existing monthly aggregate file, or an empty frame with the
-    right columns if it does not exist yet."""
-    path = AGG_DIR / f"{month}.parquet"
+def load_day_agg(date: str) -> pd.DataFrame:
+    """Load an existing daily aggregate file (data/agg/YYYY-MM-DD.parquet),
+    or an empty frame with the right columns if it does not exist yet.
+
+    One file per day, not per month: the monthly file crossed GitHub's
+    100 MB per-file block at ~11 MB of aggregates a day, which is exactly
+    how the Jul 27-29 2026 pushes died. A daily file tops out around
+    12 MB and can never grow past that."""
+    path = AGG_DIR / f"{date}.parquet"
     if path.exists():
         return pd.read_parquet(path)
     return pd.DataFrame(columns=AGG_COLUMNS)
 
 
-def save_month_agg(month: str, df: pd.DataFrame) -> None:
+def save_day_agg(date: str, df: pd.DataFrame) -> None:
     AGG_DIR.mkdir(parents=True, exist_ok=True)
-    path = AGG_DIR / f"{month}.parquet"
+    path = AGG_DIR / f"{date}.parquet"
     df = df.sort_values(AGG_GROUP_KEY, kind="stable").reset_index(drop=True)
     df.to_parquet(path, index=False)
 
 
 def merge_aggregates(existing: pd.DataFrame, new_agg: pd.DataFrame) -> pd.DataFrame:
-    """Merge new aggregate rows into an existing monthly frame by ADDING
+    """Merge new aggregate rows into an existing daily frame by ADDING
     onto any bucket that already exists for the same group key, not
     overwriting it. This is safe because the caller only ever passes in
     aggregates built from trades dedupe_for_aggregation confirmed were
@@ -586,23 +607,21 @@ def merge_aggregates(existing: pd.DataFrame, new_agg: pd.DataFrame) -> pd.DataFr
 
 
 def append_aggregates(trades: list[dict]) -> dict[str, int]:
-    """Aggregate `trades` and merge the result into the right monthly
-    data/agg/YYYY-MM.parquet file(s), summing onto existing buckets.
-    Returns {month: new_bucket_row_count_added} (not trade counts: a
+    """Aggregate `trades` and merge the result into the right daily
+    data/agg/YYYY-MM-DD.parquet file(s), summing onto existing buckets.
+    Returns {date: new_bucket_row_count_added} (not trade counts: a
     "row" here is a (date, ticker, band, side) bucket)."""
     new_agg = aggregate_trades(trades)
     if new_agg.empty:
         return {}
-    new_agg = new_agg.assign(month=new_agg["date"].str[:7])
 
     added: dict[str, int] = {}
-    for month, group in new_agg.groupby("month"):
-        group = group.drop(columns="month")
-        existing = load_month_agg(month)
+    for date, group in new_agg.groupby("date"):
+        existing = load_day_agg(date)
         before = len(existing)
         merged = merge_aggregates(existing, group)
-        save_month_agg(month, merged)
-        added[month] = len(merged) - before
+        save_day_agg(date, merged)
+        added[date] = len(merged) - before
     return added
 
 
@@ -680,6 +699,13 @@ def _existing_row_count(path: Path) -> int:
     return len(pd.read_parquet(path))
 
 
+def markets_meta_file(snapshot_date: str) -> Path:
+    """Path of the markets-metadata file for one snapshot date. One file
+    per day (~7 MB each) instead of one ever-growing markets.parquet,
+    for the same GitHub 100 MB reason as the daily aggregate files."""
+    return META_MARKETS_DIR / f"{snapshot_date}.parquet"
+
+
 def snapshot_metadata(tickers: list[str], snapshot_date: str, getter=http_get_json) -> dict:
     """Snapshot market metadata for `tickers` and series metadata for the
     series they belong to. Returns a small summary dict for logging."""
@@ -692,7 +718,8 @@ def snapshot_metadata(tickers: list[str], snapshot_date: str, getter=http_get_js
     for row in series_rows:
         row["snapshot_date"] = snapshot_date
 
-    markets_total = upsert_meta_snapshot(MARKETS_META_FILE, market_rows, ["snapshot_date", "ticker"])
+    markets_total = upsert_meta_snapshot(markets_meta_file(snapshot_date), market_rows,
+                                          ["snapshot_date", "ticker"])
     series_total = upsert_meta_snapshot(SERIES_META_FILE, series_rows, ["snapshot_date", "ticker"])
     return {
         "markets_snapshotted": len(market_rows),
@@ -779,9 +806,11 @@ def reconciliation_report(archived_counts: dict[str, float],
 
 def load_state() -> dict:
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
+        state = json.loads(STATE_FILE.read_text())
+        state.setdefault("holes", [])
+        return state
     return {"newest_ts": None, "frontier_ts": None, "backfill_complete": False,
-            "last_run_utc": None}
+            "last_run_utc": None, "holes": []}
 
 
 def save_state(state: dict) -> None:
@@ -823,13 +852,33 @@ def run(catchup_max_pages: int = CATCHUP_MAX_PAGES,
         reached_absolute_end = reached_end
     else:
         # Catch-up: whatever is newer than the last trade we archived.
-        catchup_trades, _, _ = page_trades(
+        catchup_trades, _, catchup_capped = page_trades(
             max_ts=None, stop_at_ts=newest_ts,
             max_pages=catchup_max_pages, getter=getter,
         )
         all_trades.extend(catchup_trades)
         ts_values = [t["created_ts"] for t in catchup_trades if t["created_ts"] is not None]
         if ts_values:
+            if catchup_capped:
+                # The page budget ran out BEFORE we paged back to the old
+                # watermark, so the stretch between the old watermark and
+                # the oldest trade we did fetch was never collected. The
+                # watermark still has to advance (re-pulling the fetched
+                # stretch next run would double count, because the hot
+                # buffer only covers the edges), so the honest thing is to
+                # advance it AND write the gap down as a hole that
+                # --repair-date can fix. Silently advancing is how
+                # Jul 22-25 2026 lost 30 to 70 percent of their trades.
+                hole = {
+                    "from_ts": newest_ts,
+                    "to_ts": min(ts_values),
+                    "logged_utc": datetime.now(timezone.utc).isoformat(),
+                }
+                state.setdefault("holes", []).append(hole)
+                print("WARNING: catch-up hit the page cap before reaching the "
+                      f"old watermark. Hole recorded: {_fmt_ts(hole['from_ts'])} "
+                      f"to {_fmt_ts(hole['to_ts'])}. Repair the affected dates "
+                      "with --repair-date YYYY-MM-DD.", file=sys.stderr)
             newest_ts = max(newest_ts, max(ts_values))
 
         # Backfill: keep working backward from wherever we stopped before,
@@ -862,6 +911,7 @@ def run(catchup_max_pages: int = CATCHUP_MAX_PAGES,
         "frontier_ts": frontier_ts,
         "backfill_complete": backfill_complete,
         "last_run_utc": datetime.now(timezone.utc).isoformat(),
+        "holes": state.get("holes", []),
     }
     save_state(state)
 
@@ -886,6 +936,109 @@ def _fmt_ts(ts: float | None) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+# ---------------------------------------------------------------------------
+# Repair: re-pull one whole day and replace its aggregate file
+# ---------------------------------------------------------------------------
+
+def repair_day(date_str: str, max_pages: int = REPAIR_MAX_PAGES,
+                update_state: bool = False, getter=http_get_json) -> dict:
+    """Re-pull EVERY trade for one UTC date and REPLACE that date's
+    data/agg/YYYY-MM-DD.parquet wholesale.
+
+    This is the fix for two different failures the incremental path cannot
+    heal on its own:
+      - days whose trades were partly skipped when a capped catch-up
+        advanced the watermark past them (the Jul 22-25 2026 holes), and
+      - days that were never collected at all (Jul 27-29 2026, when the
+        CI push step died on GitHub's 100 MB file block).
+    The incremental path can only ADD onto buckets, so topping up a
+    partial day would double count everything the day already had. A full
+    re-pull and file replace has no such problem, and it works as long as
+    the date is still inside Kalshi's ~60-65 day retention window.
+
+    Refuses to write anything unless the pull provably covered the whole
+    day: the pager must have crossed the start-of-day boundary without
+    hitting the page cap. A partial repair would silently look complete
+    forever, which is worse than leaving the hole.
+
+    update_state=True also advances state.json's watermark and refills the
+    hot-trades buffer from this day's newest trades. Only pass it for the
+    LAST (most recent) repaired day, so the next normal run's catch-up
+    starts exactly where the repair ended instead of re-adding days the
+    repair already wrote.
+    """
+    day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+    day_end = day_start + 86400.0
+
+    trades, reached_end, hit_cap = page_trades(
+        max_ts=day_end, stop_at_ts=day_start,
+        max_pages=max_pages, getter=getter,
+    )
+
+    ts_values = [t["created_ts"] for t in trades if t["created_ts"] is not None]
+    oldest_seen = min(ts_values) if ts_values else None
+    crossed_start = oldest_seen is not None and oldest_seen <= day_start
+
+    if hit_cap:
+        return {"date": date_str, "ok": False, "written": 0,
+                "reason": f"page cap {max_pages} hit before reaching the start of the day; "
+                          "raise --repair-max-pages and re-run"}
+    if not crossed_start and not reached_end:
+        return {"date": date_str, "ok": False, "written": 0,
+                "reason": "pager stopped before the start of the day for an unknown reason; "
+                          "nothing was written"}
+    if not crossed_start and reached_end:
+        return {"date": date_str, "ok": False, "written": 0,
+                "reason": "Kalshi's retention window no longer reaches the start of this day; "
+                          "the day cannot be repaired completely and was NOT written"}
+
+    in_day = [t for t in trades
+              if t["created_ts"] is not None and day_start <= t["created_ts"] < day_end]
+    # One trade_id can appear on two overlapping pages; keep one of each.
+    seen_ids: set = set()
+    unique_trades = []
+    for t in in_day:
+        tid = t.get("trade_id")
+        if tid in seen_ids:
+            continue
+        seen_ids.add(tid)
+        unique_trades.append(t)
+
+    prev = load_day_agg(date_str)
+    prev_trades = int(prev["trade_count"].sum()) if not prev.empty else 0
+
+    agg = aggregate_trades(unique_trades)
+    save_day_agg(date_str, agg)
+
+    if update_state:
+        state = load_state()
+        newest = max(ts_values) if ts_values else None
+        if newest is not None and (state.get("newest_ts") is None
+                                    or newest > state["newest_ts"]):
+            state["newest_ts"] = newest
+        # Refill the hot buffer with this day's newest trades so the next
+        # normal catch-up dedupes cleanly across the boundary. Same full
+        # trade-row schema the buffer always uses.
+        newest_slice = sorted(unique_trades, key=lambda t: t["created_ts"])[-HOT_BUFFER_KEEP:]
+        if newest_slice:
+            buffer_df = pd.DataFrame(newest_slice)[TRADE_COLUMNS]
+            save_hot_trades(buffer_df)
+        # Drop any recorded holes this repaired day fully covers.
+        state["holes"] = [
+            h for h in state.get("holes", [])
+            if not (h.get("from_ts") is not None and h.get("to_ts") is not None
+                    and day_start <= h["from_ts"] and h["to_ts"] <= day_end)
+        ]
+        state["last_run_utc"] = datetime.now(timezone.utc).isoformat()
+        save_state(state)
+
+    return {"date": date_str, "ok": True,
+            "trades": len(unique_trades),
+            "buckets": len(agg),
+            "prev_trade_count_in_file": prev_trades,
+            "written": len(agg)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Archive Kalshi public trades before they age out.")
     parser.add_argument("--catchup-max-pages", type=int, default=CATCHUP_MAX_PAGES,
@@ -895,7 +1048,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--raw", action="store_true",
                          help="also write every individual trade to data/raw/YYYY-MM.parquet "
                               "(local only: data/raw/ is gitignored, never committed)")
+    parser.add_argument("--repair-date", action="append", default=[],
+                         metavar="YYYY-MM-DD",
+                         help="re-pull this whole UTC day and REPLACE its data/agg file; "
+                              "repeatable; skips the normal catch-up/backfill run")
+    parser.add_argument("--repair-max-pages", type=int, default=REPAIR_MAX_PAGES,
+                         help="page budget per repaired day")
+    parser.add_argument("--finalize-repair", action="store_true",
+                         help="after the LAST repaired day, advance the watermark and hot "
+                              "buffer to the end of that day so the next normal run "
+                              "continues from there; use when the last repaired day is "
+                              "the newest data in the archive")
     args = parser.parse_args(argv)
+
+    if args.repair_date:
+        failures = 0
+        dates = sorted(args.repair_date)
+        for i, date_str in enumerate(dates):
+            is_last = i == len(dates) - 1
+            result = repair_day(date_str, max_pages=args.repair_max_pages,
+                                 update_state=args.finalize_repair and is_last)
+            if result["ok"]:
+                print(f"{date_str}: repaired, {result['trades']} trades -> "
+                      f"{result['buckets']} buckets "
+                      f"(file previously summed {result['prev_trade_count_in_file']} trades)")
+            else:
+                failures += 1
+                print(f"{date_str}: NOT repaired: {result['reason']}", file=sys.stderr)
+        return 1 if failures else 0
 
     summary = run(catchup_max_pages=args.catchup_max_pages,
                   backfill_max_pages=args.backfill_max_pages,

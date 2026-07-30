@@ -99,9 +99,9 @@ def test_append_aggregates_is_idempotent_on_the_same_batch(redirect_storage):
     # aggregate only what survives that filter.
     new_1 = archiver.dedupe_for_aggregation(trades)
     added_1 = archiver.append_aggregates(new_1)
-    assert added_1 == {"2026-07": 1}  # one bucket: TICK-A / 12 cents / yes
+    assert added_1 == {"2026-07-19": 1}  # one bucket: TICK-A / 12 cents / yes
 
-    agg = archiver.load_month_agg("2026-07")
+    agg = archiver.load_day_agg("2026-07-19")
     row = agg.iloc[0]
     assert row["trade_count"] == 2
     assert row["contracts"] == 15.0
@@ -113,7 +113,7 @@ def test_append_aggregates_is_idempotent_on_the_same_batch(redirect_storage):
     added_2 = archiver.append_aggregates(new_2)
     assert added_2 == {}
 
-    agg_again = archiver.load_month_agg("2026-07")
+    agg_again = archiver.load_day_agg("2026-07-19")
     assert len(agg_again) == 1
     row_again = agg_again.iloc[0]
     assert row_again["trade_count"] == 2   # still 2, not 4
@@ -134,7 +134,7 @@ def test_append_aggregates_sums_genuinely_new_trades_onto_an_existing_bucket(red
     ]
     archiver.append_aggregates(archiver.dedupe_for_aggregation(run_2_trades))
 
-    agg = archiver.load_month_agg("2026-07")
+    agg = archiver.load_day_agg("2026-07-19")
     assert len(agg) == 1  # still one bucket
     row = agg.iloc[0]
     assert row["trade_count"] == 3    # 2 + 1

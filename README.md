@@ -100,7 +100,7 @@ CI for more than a day or two.
 The fix: instead of storing one row per trade, I store one row per (UTC
 date, market ticker, price band in cents, taker side), with the count of
 trades, the total contracts, and the total dollars that traded in that
-bucket. That's what `data/agg/YYYY-MM.parquet` holds. For the question
+bucket. That's what `data/agg/YYYY-MM-DD.parquet` holds. For the question
 this project actually asks, "which price bands make or lose money for the
 taker," daily per-band totals are exactly what I need. I don't need to
 know the exact order trades happened in, or which specific trade was
@@ -132,7 +132,7 @@ they are not, and I'm writing that down here instead of finding out later.
 - `archiver.py`: the archiver itself. See the module docstring at the
   top of the file for exactly how it pages, dedupes, aggregates, and
   snapshots.
-- `data/agg/YYYY-MM.parquet`: one file per month, one row per (date,
+- `data/agg/YYYY-MM-DD.parquet`: one file per UTC day, one row per (date,
   ticker, price band in cents, taker side), with `trade_count`,
   `contracts`, and `dollars` summed for that bucket. This is the default,
   and the only per-trade-derived data the daily workflow commits.

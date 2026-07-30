@@ -1,14 +1,15 @@
 name: Bandwatch archiver
 
-# Once a day, off the top of the hour (GitHub delays top-of-hour crons
-# heavily, same reasoning as the owner's tipoff scanner) and at a quiet
-# minute that does not collide with tipoff's own hourly runs. 09:23 UTC is
-# about 5:23am US Eastern: a low-traffic hour for both GitHub Actions
-# runners and for us checking in on it.
+# The daily cron is OFF as of 2026-07-29. The archive now runs locally via
+# launchd (com.bandwatch.archive, see agent.py): the CI runs hit two walls
+# in one week, the 40-minute job timeout on heavy days (Jul 23, Jul 25) and
+# GitHub's 100 MB per-file block once the monthly aggregate crossed ~89 MB
+# (Jul 27-29: archiver step green, push step dead, three days lost). The
+# storage is per-day files now so pushes fit again, but the local runner
+# has no wall clock cap and its cadence is observable from the machine that
+# owns the data. This workflow stays for manual dispatch as a backup path.
 on:
-  schedule:
-    - cron: "23 9 * * *"
-  workflow_dispatch: {}   # manual "Run workflow" button for testing
+  workflow_dispatch: {}   # manual "Run workflow" button only
 
 permissions:
   contents: write   # the run commits new parquet/meta files back
@@ -23,8 +24,9 @@ jobs:
     # Kalshi's public trade firehose runs at several million trades a day
     # platform-wide (see archiver.py's page-budget comments), so a run can
     # take a while, especially while the backfill pointer is still working
-    # through older history. This is generous on purpose.
-    timeout-minutes: 40
+    # through older history. 40 was not generous enough: it killed the
+    # Jul 23 and Jul 25 2026 runs mid-archive.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
