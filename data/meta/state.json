@@ -1,7 +1,7 @@
 {
   "backfill_complete": false,
-  "frontier_ts": 1783989814.095116,
+  "frontier_ts": 1783970781.030616,
   "holes": [],
-  "last_run_utc": "2026-08-14T20:16:34.630641+00:00",
-  "newest_ts": 1786726833.26348
+  "last_run_utc": "2026-08-15T18:47:42.563412+00:00",
+  "newest_ts": 1786800641.290243
 }
